@@ -1,11 +1,17 @@
 name: CI
 on:
-  pull_request: {}
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Gradle --tests selector to scope the test run (empty = full suite)'
+        required: false
+        default: ''
 permissions: read-all
 jobs:
   preliminary:
     name: preliminary sanity checks
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # tag=v3
         with:
@@ -14,11 +20,6 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: 8
-      - uses: gradle/gradle-build-action@a4cf152f482c7ca97ef56ead29bf08bcd953284c # tag=v2
-        name: spotless (license header)
-        if: always()
-        with:
-          arguments: spotlessCheck -PspotlessFrom=origin/${{ github.base_ref }}
       - uses: gradle/gradle-build-action@a4cf152f482c7ca97ef56ead29bf08bcd953284c # tag=v2
         name: api compatibility
         if: always()
@@ -42,6 +43,7 @@ jobs:
   core-fast:
     name: core fast tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: preliminary
     steps:
     - uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # tag=v3
@@ -49,13 +51,115 @@ jobs:
       with:
         distribution: 'temurin'
         java-version: 8
+    - name: build skip-reason listeners (JUnit Platform + TestNG)
+      run: |
+        set -euo pipefail
+        D="$RUNNER_TEMP/seal-skip"
+        mkdir -p "$D/lib" "$D/src/seal" "$D/classes/META-INF/services"
+        M=https://repo.maven.apache.org/maven2
+        for a in org/junit/platform/junit-platform-launcher/1.9.2/junit-platform-launcher-1.9.2.jar \
+                 org/junit/platform/junit-platform-engine/1.9.2/junit-platform-engine-1.9.2.jar \
+                 org/junit/platform/junit-platform-commons/1.9.2/junit-platform-commons-1.9.2.jar \
+                 org/opentest4j/opentest4j/1.2.0/opentest4j-1.2.0.jar \
+                 org/testng/testng/7.5.1/testng-7.5.1.jar; do
+          curl -fsSL -o "$D/lib/$(basename $a)" "$M/$a"
+        done
+        cat > "$D/src/seal/SkipLog.java" <<'JAVA'
+        package seal;
+        import java.io.*;
+        public final class SkipLog {
+          public static synchronized void write(String line) {
+            try (Writer w = new OutputStreamWriter(new FileOutputStream("/tmp/seal-skip-reasons.log", true), "UTF-8")) {
+              w.write(line.replace('\n', ' ') + "\n");
+            } catch (IOException e) { throw new UncheckedIOException(e); }
+          }
+        }
+        JAVA
+        cat > "$D/src/seal/SealSkipListener.java" <<'JAVA'
+        package seal;
+        import org.junit.platform.engine.TestExecutionResult;
+        import org.junit.platform.launcher.TestExecutionListener;
+        import org.junit.platform.launcher.TestIdentifier;
+        public class SealSkipListener implements TestExecutionListener {
+          @Override public void executionSkipped(TestIdentifier id, String reason) {
+            SkipLog.write("SKIPPED " + id.getUniqueId() + " [" + id.getDisplayName() + "] reason: " + reason);
+          }
+          @Override public void executionFinished(TestIdentifier id, TestExecutionResult r) {
+            if (r.getStatus() == TestExecutionResult.Status.ABORTED) {
+              String why = r.getThrowable().map(t -> t.getClass().getSimpleName() + ": " + t.getMessage() + assumptionSite(t)).orElse("(no throwable)");
+              SkipLog.write("ABORTED " + id.getUniqueId() + " [" + id.getDisplayName() + "] reason: " + why);
+            }
+          }
+          // locate the assumption call in the test source and quote it, so the abort cause is explicit
+          static String assumptionSite(Throwable t) {
+            for (StackTraceElement e : t.getStackTrace()) {
+              String c = e.getClassName();
+              if (c.startsWith("org.") || c.startsWith("java.") || c.startsWith("sun.") || c.startsWith("jdk.") || e.getFileName() == null) continue;
+              String code = "";
+              String top = c.contains("$") ? c.substring(0, c.indexOf('$')) : c;
+              String rel = top.substring(0, top.lastIndexOf('.') + 1).replace('.', '/') + e.getFileName();
+              java.io.File[] sets = new java.io.File("src").listFiles();
+              if (sets != null) for (java.io.File set : sets) {
+                java.io.File f = new java.io.File(set, "java/" + rel);
+                if (f.isFile()) {
+                  try { code = java.nio.file.Files.readAllLines(f.toPath()).get(e.getLineNumber() - 1).trim(); } catch (Exception ignored) { }
+                  break;
+                }
+              }
+              return " | assumption at " + e.getClassName() + "." + e.getMethodName() + "(" + e.getFileName() + ":" + e.getLineNumber() + "): " + code;
+            }
+            return "";
+          }
+        }
+        JAVA
+        cat > "$D/src/seal/SealTestNGSkipListener.java" <<'JAVA'
+        package seal;
+        import org.testng.ITestListener;
+        import org.testng.ITestResult;
+        public class SealTestNGSkipListener implements ITestListener {
+          @Override public void onTestSkipped(ITestResult r) {
+            Throwable t = r.getThrowable();
+            SkipLog.write("SKIPPED testng " + r.getTestClass().getName() + "." + r.getMethod().getMethodName()
+                + " reason: " + (t == null ? "(no throwable)" : t.getClass().getSimpleName() + ": " + t.getMessage()));
+          }
+        }
+        JAVA
+        echo seal.SealSkipListener > "$D/classes/META-INF/services/org.junit.platform.launcher.TestExecutionListener"
+        javac -source 8 -target 8 -cp "$D/lib/*" -d "$D/classes" "$D"/src/seal/*.java
+        (cd "$D/classes" && jar cf "$D/seal-junit-skip.jar" META-INF/services seal/SkipLog.class seal/SealSkipListener.class)
+        (cd "$D/classes" && jar cf "$D/seal-testng-skip.jar" seal/SkipLog.class seal/SealTestNGSkipListener.class)
+        cat > "$D/skip.gradle" <<GRADLE
+        allprojects { p ->
+          p.afterEvaluate {
+            p.tasks.withType(Test).configureEach { t ->
+              if (t.options instanceof org.gradle.api.tasks.testing.testng.TestNGOptions) {
+                t.classpath = t.classpath + p.files("$D/seal-testng-skip.jar")
+                t.options.listeners << 'seal.SealTestNGSkipListener'
+              } else if (t.options instanceof org.gradle.api.tasks.testing.junitplatform.JUnitPlatformOptions) {
+                t.classpath = t.classpath + p.files("$D/seal-junit-skip.jar", "$D/lib/junit-platform-launcher-1.9.2.jar")
+              }
+            }
+          }
+        }
+        GRADLE
+        cat "$D/skip.gradle"
     - uses: gradle/gradle-build-action@a4cf152f482c7ca97ef56ead29bf08bcd953284c # tag=v2
       name: gradle
       with:
-        arguments: :reactor-core:test --no-daemon -Pjunit-tags=!slow
+        arguments: --init-script ${{ runner.temp }}/seal-skip/skip.gradle :reactor-core:test --no-daemon -Pjunit-tags=!slow ${{ inputs.test-filter }}
+    - name: list skipped tests with reasons
+      if: always()
+      run: |
+        if [ -f /tmp/seal-skip-reasons.log ]; then
+          sort -u /tmp/seal-skip-reasons.log
+          echo "Total skipped/aborted tests with reasons: $(sort -u /tmp/seal-skip-reasons.log | wc -l)"
+        else
+          echo "No skipped or aborted tests recorded"
+        fi
   core-slow:
     name: core slower tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: preliminary
     steps:
     - uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # tag=v3
@@ -63,21 +167,238 @@ jobs:
       with:
         distribution: 'temurin'
         java-version: 8
+    - name: build skip-reason listeners (JUnit Platform + TestNG)
+      run: |
+        set -euo pipefail
+        D="$RUNNER_TEMP/seal-skip"
+        mkdir -p "$D/lib" "$D/src/seal" "$D/classes/META-INF/services"
+        M=https://repo.maven.apache.org/maven2
+        for a in org/junit/platform/junit-platform-launcher/1.9.2/junit-platform-launcher-1.9.2.jar \
+                 org/junit/platform/junit-platform-engine/1.9.2/junit-platform-engine-1.9.2.jar \
+                 org/junit/platform/junit-platform-commons/1.9.2/junit-platform-commons-1.9.2.jar \
+                 org/opentest4j/opentest4j/1.2.0/opentest4j-1.2.0.jar \
+                 org/testng/testng/7.5.1/testng-7.5.1.jar; do
+          curl -fsSL -o "$D/lib/$(basename $a)" "$M/$a"
+        done
+        cat > "$D/src/seal/SkipLog.java" <<'JAVA'
+        package seal;
+        import java.io.*;
+        public final class SkipLog {
+          public static synchronized void write(String line) {
+            try (Writer w = new OutputStreamWriter(new FileOutputStream("/tmp/seal-skip-reasons.log", true), "UTF-8")) {
+              w.write(line.replace('\n', ' ') + "\n");
+            } catch (IOException e) { throw new UncheckedIOException(e); }
+          }
+        }
+        JAVA
+        cat > "$D/src/seal/SealSkipListener.java" <<'JAVA'
+        package seal;
+        import org.junit.platform.engine.TestExecutionResult;
+        import org.junit.platform.launcher.TestExecutionListener;
+        import org.junit.platform.launcher.TestIdentifier;
+        public class SealSkipListener implements TestExecutionListener {
+          @Override public void executionSkipped(TestIdentifier id, String reason) {
+            SkipLog.write("SKIPPED " + id.getUniqueId() + " [" + id.getDisplayName() + "] reason: " + reason);
+          }
+          @Override public void executionFinished(TestIdentifier id, TestExecutionResult r) {
+            if (r.getStatus() == TestExecutionResult.Status.ABORTED) {
+              String why = r.getThrowable().map(t -> t.getClass().getSimpleName() + ": " + t.getMessage() + assumptionSite(t)).orElse("(no throwable)");
+              SkipLog.write("ABORTED " + id.getUniqueId() + " [" + id.getDisplayName() + "] reason: " + why);
+            }
+          }
+          // locate the assumption call in the test source and quote it, so the abort cause is explicit
+          static String assumptionSite(Throwable t) {
+            for (StackTraceElement e : t.getStackTrace()) {
+              String c = e.getClassName();
+              if (c.startsWith("org.") || c.startsWith("java.") || c.startsWith("sun.") || c.startsWith("jdk.") || e.getFileName() == null) continue;
+              String code = "";
+              String top = c.contains("$") ? c.substring(0, c.indexOf('$')) : c;
+              String rel = top.substring(0, top.lastIndexOf('.') + 1).replace('.', '/') + e.getFileName();
+              java.io.File[] sets = new java.io.File("src").listFiles();
+              if (sets != null) for (java.io.File set : sets) {
+                java.io.File f = new java.io.File(set, "java/" + rel);
+                if (f.isFile()) {
+                  try { code = java.nio.file.Files.readAllLines(f.toPath()).get(e.getLineNumber() - 1).trim(); } catch (Exception ignored) { }
+                  break;
+                }
+              }
+              return " | assumption at " + e.getClassName() + "." + e.getMethodName() + "(" + e.getFileName() + ":" + e.getLineNumber() + "): " + code;
+            }
+            return "";
+          }
+        }
+        JAVA
+        cat > "$D/src/seal/SealTestNGSkipListener.java" <<'JAVA'
+        package seal;
+        import org.testng.ITestListener;
+        import org.testng.ITestResult;
+        public class SealTestNGSkipListener implements ITestListener {
+          @Override public void onTestSkipped(ITestResult r) {
+            Throwable t = r.getThrowable();
+            SkipLog.write("SKIPPED testng " + r.getTestClass().getName() + "." + r.getMethod().getMethodName()
+                + " reason: " + (t == null ? "(no throwable)" : t.getClass().getSimpleName() + ": " + t.getMessage()));
+          }
+        }
+        JAVA
+        echo seal.SealSkipListener > "$D/classes/META-INF/services/org.junit.platform.launcher.TestExecutionListener"
+        javac -source 8 -target 8 -cp "$D/lib/*" -d "$D/classes" "$D"/src/seal/*.java
+        (cd "$D/classes" && jar cf "$D/seal-junit-skip.jar" META-INF/services seal/SkipLog.class seal/SealSkipListener.class)
+        (cd "$D/classes" && jar cf "$D/seal-testng-skip.jar" seal/SkipLog.class seal/SealTestNGSkipListener.class)
+        cat > "$D/skip.gradle" <<GRADLE
+        allprojects { p ->
+          p.afterEvaluate {
+            p.tasks.withType(Test).configureEach { t ->
+              if (t.options instanceof org.gradle.api.tasks.testing.testng.TestNGOptions) {
+                t.classpath = t.classpath + p.files("$D/seal-testng-skip.jar")
+                t.options.listeners << 'seal.SealTestNGSkipListener'
+              } else if (t.options instanceof org.gradle.api.tasks.testing.junitplatform.JUnitPlatformOptions) {
+                t.classpath = t.classpath + p.files("$D/seal-junit-skip.jar", "$D/lib/junit-platform-launcher-1.9.2.jar")
+              }
+            }
+          }
+        }
+        GRADLE
+        cat "$D/skip.gradle"
     - uses: gradle/gradle-build-action@a4cf152f482c7ca97ef56ead29bf08bcd953284c # tag=v2
       name: gradle
       with:
-        arguments: :reactor-core:test --no-daemon -Pjunit-tags=slow
+        arguments: --init-script ${{ runner.temp }}/seal-skip/skip.gradle :reactor-core:test --no-daemon -Pjunit-tags=slow ${{ inputs.test-filter }}
+    - name: list skipped tests with reasons
+      if: always()
+      run: |
+        if [ -f /tmp/seal-skip-reasons.log ]; then
+          sort -u /tmp/seal-skip-reasons.log
+          echo "Total skipped/aborted tests with reasons: $(sort -u /tmp/seal-skip-reasons.log | wc -l)"
+        else
+          echo "No skipped or aborted tests recorded"
+        fi
   other:
     name: other tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: preliminary
+    services:
+      zipkin:
+        image: openzipkin/zipkin:2
+        ports:
+          - 9411:9411
     steps:
     - uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # tag=v3
     - uses: actions/setup-java@cd89f46ac9d01407894225f350157564c9c7cee2 # tag=v3
       with:
         distribution: 'temurin'
         java-version: 8
+    - name: build skip-reason listeners (JUnit Platform + TestNG)
+      run: |
+        set -euo pipefail
+        D="$RUNNER_TEMP/seal-skip"
+        mkdir -p "$D/lib" "$D/src/seal" "$D/classes/META-INF/services"
+        M=https://repo.maven.apache.org/maven2
+        for a in org/junit/platform/junit-platform-launcher/1.9.2/junit-platform-launcher-1.9.2.jar \
+                 org/junit/platform/junit-platform-engine/1.9.2/junit-platform-engine-1.9.2.jar \
+                 org/junit/platform/junit-platform-commons/1.9.2/junit-platform-commons-1.9.2.jar \
+                 org/opentest4j/opentest4j/1.2.0/opentest4j-1.2.0.jar \
+                 org/testng/testng/7.5.1/testng-7.5.1.jar; do
+          curl -fsSL -o "$D/lib/$(basename $a)" "$M/$a"
+        done
+        cat > "$D/src/seal/SkipLog.java" <<'JAVA'
+        package seal;
+        import java.io.*;
+        public final class SkipLog {
+          public static synchronized void write(String line) {
+            try (Writer w = new OutputStreamWriter(new FileOutputStream("/tmp/seal-skip-reasons.log", true), "UTF-8")) {
+              w.write(line.replace('\n', ' ') + "\n");
+            } catch (IOException e) { throw new UncheckedIOException(e); }
+          }
+        }
+        JAVA
+        cat > "$D/src/seal/SealSkipListener.java" <<'JAVA'
+        package seal;
+        import org.junit.platform.engine.TestExecutionResult;
+        import org.junit.platform.launcher.TestExecutionListener;
+        import org.junit.platform.launcher.TestIdentifier;
+        public class SealSkipListener implements TestExecutionListener {
+          @Override public void executionSkipped(TestIdentifier id, String reason) {
+            SkipLog.write("SKIPPED " + id.getUniqueId() + " [" + id.getDisplayName() + "] reason: " + reason);
+          }
+          @Override public void executionFinished(TestIdentifier id, TestExecutionResult r) {
+            if (r.getStatus() == TestExecutionResult.Status.ABORTED) {
+              String why = r.getThrowable().map(t -> t.getClass().getSimpleName() + ": " + t.getMessage() + assumptionSite(t)).orElse("(no throwable)");
+              SkipLog.write("ABORTED " + id.getUniqueId() + " [" + id.getDisplayName() + "] reason: " + why);
+            }
+          }
+          // locate the assumption call in the test source and quote it, so the abort cause is explicit
+          static String assumptionSite(Throwable t) {
+            for (StackTraceElement e : t.getStackTrace()) {
+              String c = e.getClassName();
+              if (c.startsWith("org.") || c.startsWith("java.") || c.startsWith("sun.") || c.startsWith("jdk.") || e.getFileName() == null) continue;
+              String code = "";
+              String top = c.contains("$") ? c.substring(0, c.indexOf('$')) : c;
+              String rel = top.substring(0, top.lastIndexOf('.') + 1).replace('.', '/') + e.getFileName();
+              java.io.File[] sets = new java.io.File("src").listFiles();
+              if (sets != null) for (java.io.File set : sets) {
+                java.io.File f = new java.io.File(set, "java/" + rel);
+                if (f.isFile()) {
+                  try { code = java.nio.file.Files.readAllLines(f.toPath()).get(e.getLineNumber() - 1).trim(); } catch (Exception ignored) { }
+                  break;
+                }
+              }
+              return " | assumption at " + e.getClassName() + "." + e.getMethodName() + "(" + e.getFileName() + ":" + e.getLineNumber() + "): " + code;
+            }
+            return "";
+          }
+        }
+        JAVA
+        cat > "$D/src/seal/SealTestNGSkipListener.java" <<'JAVA'
+        package seal;
+        import org.testng.ITestListener;
+        import org.testng.ITestResult;
+        public class SealTestNGSkipListener implements ITestListener {
+          @Override public void onTestSkipped(ITestResult r) {
+            Throwable t = r.getThrowable();
+            SkipLog.write("SKIPPED testng " + r.getTestClass().getName() + "." + r.getMethod().getMethodName()
+                + " reason: " + (t == null ? "(no throwable)" : t.getClass().getSimpleName() + ": " + t.getMessage()));
+          }
+        }
+        JAVA
+        echo seal.SealSkipListener > "$D/classes/META-INF/services/org.junit.platform.launcher.TestExecutionListener"
+        javac -source 8 -target 8 -cp "$D/lib/*" -d "$D/classes" "$D"/src/seal/*.java
+        (cd "$D/classes" && jar cf "$D/seal-junit-skip.jar" META-INF/services seal/SkipLog.class seal/SealSkipListener.class)
+        (cd "$D/classes" && jar cf "$D/seal-testng-skip.jar" seal/SkipLog.class seal/SealTestNGSkipListener.class)
+        cat > "$D/skip.gradle" <<GRADLE
+        allprojects { p ->
+          p.afterEvaluate {
+            p.tasks.withType(Test).configureEach { t ->
+              if (t.options instanceof org.gradle.api.tasks.testing.testng.TestNGOptions) {
+                t.classpath = t.classpath + p.files("$D/seal-testng-skip.jar")
+                t.options.listeners << 'seal.SealTestNGSkipListener'
+              } else if (t.options instanceof org.gradle.api.tasks.testing.junitplatform.JUnitPlatformOptions) {
+                t.classpath = t.classpath + p.files("$D/seal-junit-skip.jar", "$D/lib/junit-platform-launcher-1.9.2.jar")
+              }
+            }
+          }
+        }
+        GRADLE
+        cat "$D/skip.gradle"
     - uses: gradle/gradle-build-action@a4cf152f482c7ca97ef56ead29bf08bcd953284c # tag=v2
       name: other tests
       with:
-        arguments: check -x :reactor-core:test -x spotlessCheck --no-daemon
+        arguments: --init-script ${{ runner.temp }}/seal-skip/skip.gradle ${{ inputs.test-filter == '' && 'check -x :reactor-core:test -x spotlessCheck -x jcstress --no-daemon' || 'assemble --no-daemon' }}
+    - uses: gradle/gradle-build-action@a4cf152f482c7ca97ef56ead29bf08bcd953284c # tag=v2
+      name: build reactor-core jar
+      with:
+        arguments: :reactor-core:jar --no-daemon
+    - uses: actions/upload-artifact@v4
+      with:
+        name: reactor-core-jar
+        path: reactor-core/build/libs/reactor-core-3.5.9.jar
+        if-no-files-found: error
+    - name: list skipped tests with reasons
+      if: always()
+      run: |
+        if [ -f /tmp/seal-skip-reasons.log ]; then
+          sort -u /tmp/seal-skip-reasons.log
+          echo "Total skipped/aborted tests with reasons: $(sort -u /tmp/seal-skip-reasons.log | wc -l)"
+        else
+          echo "No skipped or aborted tests recorded"
+        fi

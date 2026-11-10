@@ -57,6 +57,14 @@ public class MicrometerObservationIntegrationTest {
             this.automatic = automatic;
         }
 
+        // Sealed build: WAVEFRONT_* setups need a Tanzu Observability (Wavefront) SaaS server URL
+        // and API token that are not available in CI; run the in-memory and Zipkin setups only.
+        @Override
+        public TracingSetup[] getTracingSetup() {
+            return new TracingSetup[] { TracingSetup.IN_MEMORY_OTEL, TracingSetup.IN_MEMORY_BRAVE,
+                    TracingSetup.ZIPKIN_OTEL, TracingSetup.ZIPKIN_BRAVE };
+        }
+
         @Override
         public SampleTestRunner.SampleTestRunnerConsumer yourCode() throws Exception {
             if (this.automatic) {
